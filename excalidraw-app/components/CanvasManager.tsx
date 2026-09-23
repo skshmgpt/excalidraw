@@ -43,7 +43,8 @@ export const CanvasManager = ({
       left: "50%",
       padding: 6,
       position: "fixed",
-      top: 10,
+      bottom: 12,
+      maxWidth: "calc(100vw - 24px)",
       transform: "translateX(-50%)",
       zIndex: 10,
     }}
@@ -54,7 +55,7 @@ export const CanvasManager = ({
       aria-label="Active canvas"
       disabled={disabled}
       onChange={(event) => onSelect(event.currentTarget.value)}
-      style={{ ...controlStyle, maxWidth: 180 }}
+      style={{ ...controlStyle, maxWidth: "min(180px, 30vw)" }}
       value={activeCanvasId}
     >
       {canvases.map((canvas) => (
