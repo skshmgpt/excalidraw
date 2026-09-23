@@ -1,5 +1,6 @@
 import {
   Excalidraw,
+  exportToSvg,
   LiveCollaborationTrigger,
   TTDDialogTrigger,
   CaptureUpdateAction,
@@ -50,7 +51,7 @@ import {
   share,
   youtubeIcon,
 } from "@excalidraw/excalidraw/components/icons";
-import { isElementLink } from "@excalidraw/element";
+import { getNonDeletedElements, isElementLink } from "@excalidraw/element";
 import {
   bumpElementVersions,
   restoreAppState,
@@ -482,6 +483,11 @@ const ExcalidrawWrapper = () => {
     null,
   );
   const canvasManagerRef = useRef<CanvasManagerData | null>(null);
+  const [canvasPreviews, setCanvasPreviews] = useState<Record<string, string>>(
+    {},
+  );
+  const [isLoadingCanvasPreviews, setIsLoadingCanvasPreviews] = useState(false);
+  const canvasPreviewRequestRef = useRef(0);
   const [isSwitchingCanvas, setIsSwitchingCanvas] = useState(false);
   const debouncedCanvasManagerSave = useMemo(
     () =>
@@ -979,6 +985,73 @@ const ExcalidrawWrapper = () => {
     }
   };
 
+  const onRequestCanvasPreviews = async () => {
+    const workspace = canvasManagerRef.current;
+    if (!workspace || !excalidrawAPI) {
+      return;
+    }
+
+    const savedWorkspace = saveCurrentCanvas(workspace);
+    persistCanvasManagerImmediately(savedWorkspace);
+    const requestId = ++canvasPreviewRequestRef.current;
+    setCanvasPreviews({});
+    setIsLoadingCanvasPreviews(true);
+
+    try {
+      for (const canvas of savedWorkspace.canvases) {
+        if (canvasPreviewRequestRef.current !== requestId) {
+          return;
+        }
+
+        const elements = getNonDeletedElements(canvas.elements);
+        if (!elements.length) {
+          continue;
+        }
+
+        try {
+          let files: BinaryFiles;
+          if (canvas.id === savedWorkspace.activeCanvasId) {
+            files = excalidrawAPI.getFiles();
+          } else {
+            const fileIds = elements.reduce((ids, element) => {
+              if (isInitializedImageElement(element)) {
+                ids.push(element.fileId);
+              }
+              return ids;
+            }, [] as FileId[]);
+            const { loadedFiles } =
+              await LocalData.fileStorage.getFiles(fileIds);
+            files = Object.fromEntries(
+              loadedFiles.map((file) => [file.id, file]),
+            );
+          }
+
+          const svg = await exportToSvg({
+            elements,
+            appState: canvas.appState,
+            files,
+            exportPadding: 8,
+            skipInliningFonts: true,
+          });
+          if (canvasPreviewRequestRef.current === requestId) {
+            setCanvasPreviews((previews) => ({
+              ...previews,
+              [canvas.id]:
+                "data:image/svg+xml;charset=utf-8," +
+                encodeURIComponent(svg.outerHTML),
+            }));
+          }
+        } catch (error) {
+          console.warn("Unable to render canvas preview", canvas.name, error);
+        }
+      }
+    } finally {
+      if (canvasPreviewRequestRef.current === requestId) {
+        setIsLoadingCanvasPreviews(false);
+      }
+    }
+  };
+
   const activateCanvas = async (
     canvasId: string,
     workspace: CanvasManagerData,
@@ -1067,30 +1140,30 @@ const ExcalidrawWrapper = () => {
     );
   };
 
-  const onRenameCanvas = () => {
+  const onRenameCanvas = (canvasId: string, name: string) => {
     const workspace = canvasManagerRef.current;
-    const canvas = workspace && getActiveCanvas(workspace);
-    const appWindow = appContainerRef.current?.ownerDocument.defaultView;
-    if (!workspace || !canvas || !appWindow || isSwitchingCanvas) {
-      return;
-    }
-
-    const name = appWindow.prompt("Rename canvas", canvas.name)?.trim();
-    if (!name) {
+    const trimmedName = name.trim().slice(0, 80);
+    if (
+      !workspace ||
+      !workspace.canvases.some((canvas) => canvas.id === canvasId) ||
+      !trimmedName ||
+      isSwitchingCanvas
+    ) {
       return;
     }
 
     persistCanvasManagerImmediately({
       ...workspace,
       canvases: workspace.canvases.map((item) =>
-        item.id === canvas.id ? { ...item, name } : item,
+        item.id === canvasId ? { ...item, name: trimmedName } : item,
       ),
     });
   };
 
-  const onDeleteCanvas = () => {
+  const onDeleteCanvas = (canvasId: string) => {
     const workspace = canvasManagerRef.current;
-    const canvas = workspace && getActiveCanvas(workspace);
+    const canvas =
+      workspace?.canvases.find((item) => item.id === canvasId) ?? null;
     const appWindow = appContainerRef.current?.ownerDocument.defaultView;
     if (
       !workspace ||
@@ -1110,6 +1183,13 @@ const ExcalidrawWrapper = () => {
     const remainingCanvases = savedWorkspace.canvases.filter(
       (item) => item.id !== canvas.id,
     );
+    if (canvas.id !== savedWorkspace.activeCanvasId) {
+      persistCanvasManagerImmediately({
+        ...savedWorkspace,
+        canvases: remainingCanvases,
+      });
+      return;
+    }
     const nextCanvas = remainingCanvases[Math.max(0, canvasIndex - 1)];
     void activateCanvas(
       nextCanvas.id,
@@ -1654,18 +1734,25 @@ const ExcalidrawWrapper = () => {
             ref={debugCanvasRef}
           />
         )}
+        {canvasManager && (
+          <CanvasManager
+            activeCanvasId={canvasManager.activeCanvasId}
+            canvases={canvasManager.canvases.map(({ id, name, elements }) => ({
+              id,
+              name,
+              elementCount: getNonDeletedElements(elements).length,
+              preview: canvasPreviews[id],
+            }))}
+            disabled={isCollaborating || isSwitchingCanvas}
+            isLoadingPreviews={isLoadingCanvasPreviews}
+            onCreate={onCreateCanvas}
+            onDelete={onDeleteCanvas}
+            onRename={onRenameCanvas}
+            onRequestPreviews={onRequestCanvasPreviews}
+            onSelect={onSelectCanvas}
+          />
+        )}
       </Excalidraw>
-      {canvasManager && (
-        <CanvasManager
-          activeCanvasId={canvasManager.activeCanvasId}
-          canvases={canvasManager.canvases.map(({ id, name }) => ({ id, name }))}
-          disabled={isCollaborating || isSwitchingCanvas}
-          onCreate={onCreateCanvas}
-          onDelete={onDeleteCanvas}
-          onRename={onRenameCanvas}
-          onSelect={onSelectCanvas}
-        />
-      )}
     </div>
   );
 };
