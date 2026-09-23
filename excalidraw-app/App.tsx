@@ -9,7 +9,10 @@ import {
   useExcalidrawAPI,
 } from "@excalidraw/excalidraw";
 import { trackEvent } from "@excalidraw/excalidraw/analytics";
-import { getDefaultAppState } from "@excalidraw/excalidraw/appState";
+import {
+  clearAppStateForLocalStorage,
+  getDefaultAppState,
+} from "@excalidraw/excalidraw/appState";
 import {
   CommandPalette,
   DEFAULT_CATEGORIES,
@@ -148,6 +151,7 @@ import "./index.scss";
 
 import { ExcalidrawPlusPromoBanner } from "./components/ExcalidrawPlusPromoBanner";
 import { AppSidebar } from "./components/AppSidebar";
+import { CanvasManager } from "./components/CanvasManager";
 
 import type { CollabAPI } from "./collab/Collab";
 
@@ -214,9 +218,108 @@ const shareableLinkConfirmDialog = {
   color: "danger",
 } as const;
 
+const CANVAS_MANAGER_STORAGE_KEY = "excalidraw-app:canvas-manager";
+
+type ManagedCanvas = {
+  id: string;
+  name: string;
+  elements: ReturnType<typeof restoreElements>;
+  appState: ReturnType<typeof clearAppStateForLocalStorage>;
+};
+
+type CanvasManagerData = {
+  activeCanvasId: string;
+  canvases: ManagedCanvas[];
+};
+
+const createCanvasId = () =>
+  `canvas-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+const saveCanvasManagerToStorage = (
+  storage: Storage,
+  canvasManager: CanvasManagerData,
+) => {
+  try {
+    storage.setItem(CANVAS_MANAGER_STORAGE_KEY, JSON.stringify(canvasManager));
+  } catch (error) {
+    console.error("Unable to save canvases", error);
+  }
+};
+
+const createCanvasManager = (
+  localDataState: ReturnType<typeof importFromLocalStorage>,
+): CanvasManagerData => {
+  const canvas: ManagedCanvas = {
+    id: createCanvasId(),
+    name: "Canvas 1",
+    elements: restoreElements(localDataState.elements, null, {
+      repairBindings: true,
+      deleteInvisibleElements: true,
+    }),
+    appState: clearAppStateForLocalStorage(
+      restoreAppState(localDataState.appState, getDefaultAppState()),
+    ),
+  };
+
+  return { activeCanvasId: canvas.id, canvases: [canvas] };
+};
+
+const loadCanvasManager = (
+  storage: Storage,
+  localDataState: ReturnType<typeof importFromLocalStorage>,
+): CanvasManagerData => {
+  try {
+    const savedValue = storage.getItem(CANVAS_MANAGER_STORAGE_KEY);
+    if (savedValue) {
+      const saved = JSON.parse(savedValue) as CanvasManagerData;
+      if (
+        Array.isArray(saved.canvases) &&
+        saved.canvases.length > 0 &&
+        saved.canvases.every(
+          (canvas) =>
+            typeof canvas.id === "string" &&
+            typeof canvas.name === "string" &&
+            Array.isArray(canvas.elements),
+        ) &&
+        saved.canvases.some((canvas) => canvas.id === saved.activeCanvasId)
+      ) {
+        return {
+          ...saved,
+          canvases: saved.canvases.map((canvas) => ({
+            ...canvas,
+            appState: canvas.appState || getDefaultAppState(),
+          })),
+        };
+      }
+    }
+  } catch (error) {
+    console.warn("Unable to read saved canvases", error);
+  }
+
+  const canvasManager = createCanvasManager(localDataState);
+  saveCanvasManagerToStorage(storage, canvasManager);
+  return canvasManager;
+};
+
+const getActiveCanvas = (canvasManager: CanvasManagerData) =>
+  canvasManager.canvases.find(
+    (canvas) => canvas.id === canvasManager.activeCanvasId,
+  );
+
+const getCanvasLocalDataState = (canvasManager: CanvasManagerData) => {
+  const canvas = getActiveCanvas(canvasManager);
+  return canvas
+    ? {
+        elements: canvas.elements,
+        appState: restoreAppState(canvas.appState, getDefaultAppState()),
+      }
+    : undefined;
+};
+
 const initializeScene = async (opts: {
   collabAPI: CollabAPI | null;
   excalidrawAPI: ExcalidrawImperativeAPI;
+  localDataState?: ReturnType<typeof importFromLocalStorage>;
 }): Promise<
   { scene: ExcalidrawInitialDataState | null } & (
     | { isExternalScene: true; id: string; key: string }
@@ -230,7 +333,7 @@ const initializeScene = async (opts: {
   );
   const externalUrlMatch = window.location.hash.match(/^#url=(.*)$/);
 
-  const localDataState = importFromLocalStorage();
+  const localDataState = opts.localDataState ?? importFromLocalStorage();
 
   let scene: Omit<
     RestoredDataState,
@@ -374,6 +477,23 @@ const initializeScene = async (opts: {
 
 const ExcalidrawWrapper = () => {
   const excalidrawAPI = useExcalidrawAPI();
+  const appContainerRef = useRef<HTMLDivElement>(null);
+  const [canvasManager, setCanvasManager] = useState<CanvasManagerData | null>(
+    null,
+  );
+  const canvasManagerRef = useRef<CanvasManagerData | null>(null);
+  const [isSwitchingCanvas, setIsSwitchingCanvas] = useState(false);
+  const debouncedCanvasManagerSave = useMemo(
+    () =>
+      debounce((data: CanvasManagerData) => {
+        const storage =
+          appContainerRef.current?.ownerDocument.defaultView?.localStorage;
+        if (storage) {
+          saveCanvasManagerToStorage(storage, data);
+        }
+      }, 300),
+    [],
+  );
 
   const [errorMessage, setErrorMessage] = useState("");
   const isCollabDisabled = isRunningInIframe();
@@ -396,6 +516,10 @@ const ExcalidrawWrapper = () => {
   }
 
   const debugCanvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    return () => debouncedCanvasManagerSave.flush();
+  }, [debouncedCanvasManagerSave]);
 
   useEffect(() => {
     trackEvent("load", "frame", getFrame());
@@ -476,7 +600,11 @@ const ExcalidrawWrapper = () => {
   // Hoisted loadImages
   // ---------------------------------------------------------------------------
   const loadImages = useCallback(
-    (data: ResolutionType<typeof initializeScene>, isInitialLoad = false) => {
+    (
+      data: ResolutionType<typeof initializeScene>,
+      isInitialLoad = false,
+      isCanvasSwitch = false,
+    ) => {
       if (!data.scene || !excalidrawAPI) {
         return;
       }
@@ -531,7 +659,7 @@ const ExcalidrawWrapper = () => {
               ),
             ]);
           });
-        } else if (isInitialLoad) {
+        } else if (isInitialLoad || isCanvasSwitch) {
           if (fileIds.length) {
             LocalData.fileStorage
               .getFiles(fileIds)
@@ -546,11 +674,21 @@ const ExcalidrawWrapper = () => {
                 });
               });
           }
-          // on fresh load, clear unused files from IDB (from previous
-          // session)
-          LocalData.fileStorage.clearObsoleteFiles({
-            currentFileIds: fileIds,
-          });
+          if (isInitialLoad) {
+            // on fresh load, clear unused files from IDB (from previous
+            // session)
+            const retainedFileIds = new Set(fileIds);
+            canvasManagerRef.current?.canvases.forEach((canvas) => {
+              canvas.elements.forEach((element) => {
+                if (isInitializedImageElement(element)) {
+                  retainedFileIds.add(element.fileId);
+                }
+              });
+            });
+            LocalData.fileStorage.clearObsoleteFiles({
+              currentFileIds: [...retainedFileIds],
+            });
+          }
         }
       }
     },
@@ -562,7 +700,21 @@ const ExcalidrawWrapper = () => {
       return;
     }
 
-    initializeScene({ collabAPI, excalidrawAPI }).then(async (data) => {
+    const storage =
+      appContainerRef.current?.ownerDocument.defaultView?.localStorage;
+    const legacyLocalData = importFromLocalStorage();
+    const initialCanvasManager = storage
+      ? loadCanvasManager(storage, legacyLocalData)
+      : createCanvasManager(legacyLocalData);
+    canvasManagerRef.current = initialCanvasManager;
+    setCanvasManager(initialCanvasManager);
+
+    initializeScene({
+      collabAPI,
+      excalidrawAPI,
+      localDataState:
+        getCanvasLocalDataState(initialCanvasManager) ?? legacyLocalData,
+    }).then(async (data) => {
       loadImages(data, /* isInitialLoad */ true);
       initialStatePromiseRef.current.promise.resolve(data.scene);
     });
@@ -579,7 +731,14 @@ const ExcalidrawWrapper = () => {
         }
         excalidrawAPI.updateScene({ appState: { isLoading: true } });
 
-        initializeScene({ collabAPI, excalidrawAPI }).then((data) => {
+        initializeScene({
+          collabAPI,
+          excalidrawAPI,
+          localDataState:
+            (canvasManagerRef.current &&
+              getCanvasLocalDataState(canvasManagerRef.current)) ??
+            importFromLocalStorage(),
+        }).then((data) => {
           loadImages(data);
           if (data.scene) {
             excalidrawAPI.updateScene({
@@ -655,11 +814,13 @@ const ExcalidrawWrapper = () => {
 
     const onUnload = () => {
       LocalData.flushSave();
+      debouncedCanvasManagerSave.flush();
     };
 
     const visibilityChange = (event: FocusEvent | Event) => {
       if (event.type === EVENT.BLUR || document.hidden) {
         LocalData.flushSave();
+        debouncedCanvasManagerSave.flush();
       }
       if (
         event.type === EVENT.VISIBILITY_CHANGE ||
@@ -685,11 +846,19 @@ const ExcalidrawWrapper = () => {
         false,
       );
     };
-  }, [isCollabDisabled, collabAPI, excalidrawAPI, setLangCode, loadImages]);
+  }, [
+    isCollabDisabled,
+    collabAPI,
+    excalidrawAPI,
+    setLangCode,
+    loadImages,
+    debouncedCanvasManagerSave,
+  ]);
 
   useEffect(() => {
     const unloadHandler = (event: BeforeUnloadEvent) => {
       LocalData.flushSave();
+      debouncedCanvasManagerSave.flush();
 
       if (
         excalidrawAPI &&
@@ -710,7 +879,7 @@ const ExcalidrawWrapper = () => {
     return () => {
       window.removeEventListener(EVENT.BEFORE_UNLOAD, unloadHandler);
     };
-  }, [excalidrawAPI]);
+  }, [excalidrawAPI, debouncedCanvasManagerSave]);
 
   const onChange = (
     elements: readonly OrderedExcalidrawElement[],
@@ -753,6 +922,24 @@ const ExcalidrawWrapper = () => {
       });
     }
 
+    if (!collabAPI?.isCollaborating() && canvasManagerRef.current) {
+      const currentCanvasManager = canvasManagerRef.current;
+      const updatedCanvasManager = {
+        ...currentCanvasManager,
+        canvases: currentCanvasManager.canvases.map((canvas) =>
+          canvas.id === currentCanvasManager.activeCanvasId
+            ? {
+                ...canvas,
+                elements: [...elements],
+                appState: clearAppStateForLocalStorage(appState),
+              }
+            : canvas,
+        ),
+      };
+      canvasManagerRef.current = updatedCanvasManager;
+      debouncedCanvasManagerSave(updatedCanvasManager);
+    }
+
     // Render the debug scene if the debug canvas is available
     if (debugCanvasRef.current && excalidrawAPI) {
       debugRenderer(
@@ -762,6 +949,176 @@ const ExcalidrawWrapper = () => {
         window.devicePixelRatio,
       );
     }
+  };
+
+  const saveCurrentCanvas = (workspace: CanvasManagerData) => {
+    if (!excalidrawAPI) {
+      return workspace;
+    }
+
+    const elements = excalidrawAPI.getSceneElements();
+    const appState = clearAppStateForLocalStorage(excalidrawAPI.getAppState());
+    return {
+      ...workspace,
+      canvases: workspace.canvases.map((canvas) =>
+        canvas.id === workspace.activeCanvasId
+          ? { ...canvas, elements: [...elements], appState }
+          : canvas,
+      ),
+    };
+  };
+
+  const persistCanvasManagerImmediately = (workspace: CanvasManagerData) => {
+    canvasManagerRef.current = workspace;
+    setCanvasManager(workspace);
+    debouncedCanvasManagerSave.flush();
+    const storage =
+      appContainerRef.current?.ownerDocument.defaultView?.localStorage;
+    if (storage) {
+      saveCanvasManagerToStorage(storage, workspace);
+    }
+  };
+
+  const activateCanvas = async (
+    canvasId: string,
+    workspace: CanvasManagerData,
+    saveActiveCanvas = true,
+  ) => {
+    if (!excalidrawAPI || collabAPI?.isCollaborating()) {
+      return;
+    }
+
+    const currentElements = excalidrawAPI.getSceneElements();
+    const savedWorkspace = saveActiveCanvas
+      ? saveCurrentCanvas(workspace)
+      : workspace;
+    const canvas = savedWorkspace.canvases.find(
+      (item) => item.id === canvasId,
+    );
+    if (!canvas) {
+      return;
+    }
+
+    const nextWorkspace = {
+      ...savedWorkspace,
+      activeCanvasId: canvasId,
+    };
+    persistCanvasManagerImmediately(nextWorkspace);
+    setIsSwitchingCanvas(true);
+
+    try {
+      LocalData.flushSave();
+      await LocalData.fileStorage.saveFiles({
+        elements: currentElements,
+        files: excalidrawAPI.getFiles(),
+      });
+
+      const scene = {
+        elements: restoreElements(canvas.elements, null, {
+          repairBindings: true,
+          deleteInvisibleElements: true,
+        }),
+        appState: restoreAppState(canvas.appState, getDefaultAppState()),
+      };
+      excalidrawAPI.updateScene({
+        ...scene,
+        captureUpdate: CaptureUpdateAction.IMMEDIATELY,
+      });
+      loadImages({ scene, isExternalScene: false }, false, true);
+    } finally {
+      setIsSwitchingCanvas(false);
+    }
+  };
+
+  const onSelectCanvas = (canvasId: string) => {
+    const workspace = canvasManagerRef.current;
+    if (
+      workspace &&
+      workspace.activeCanvasId !== canvasId &&
+      !isSwitchingCanvas
+    ) {
+      void activateCanvas(canvasId, workspace);
+    }
+  };
+
+  const onCreateCanvas = () => {
+    const workspace = canvasManagerRef.current;
+    if (!workspace || !excalidrawAPI || isSwitchingCanvas) {
+      return;
+    }
+
+    const savedWorkspace = saveCurrentCanvas(workspace);
+    const canvas: ManagedCanvas = {
+      id: createCanvasId(),
+      name: `Canvas ${savedWorkspace.canvases.length + 1}`,
+      elements: [],
+      appState: restoreAppState(
+        { theme: excalidrawAPI.getAppState().theme },
+        getDefaultAppState(),
+      ),
+    };
+    void activateCanvas(
+      canvas.id,
+      {
+        activeCanvasId: canvas.id,
+        canvases: [...savedWorkspace.canvases, canvas],
+      },
+      false,
+    );
+  };
+
+  const onRenameCanvas = () => {
+    const workspace = canvasManagerRef.current;
+    const canvas = workspace && getActiveCanvas(workspace);
+    const appWindow = appContainerRef.current?.ownerDocument.defaultView;
+    if (!workspace || !canvas || !appWindow || isSwitchingCanvas) {
+      return;
+    }
+
+    const name = appWindow.prompt("Rename canvas", canvas.name)?.trim();
+    if (!name) {
+      return;
+    }
+
+    persistCanvasManagerImmediately({
+      ...workspace,
+      canvases: workspace.canvases.map((item) =>
+        item.id === canvas.id ? { ...item, name } : item,
+      ),
+    });
+  };
+
+  const onDeleteCanvas = () => {
+    const workspace = canvasManagerRef.current;
+    const canvas = workspace && getActiveCanvas(workspace);
+    const appWindow = appContainerRef.current?.ownerDocument.defaultView;
+    if (
+      !workspace ||
+      !canvas ||
+      workspace.canvases.length < 2 ||
+      !appWindow ||
+      isSwitchingCanvas ||
+      !appWindow.confirm(`Delete "${canvas.name}"? This cannot be undone.`)
+    ) {
+      return;
+    }
+
+    const savedWorkspace = saveCurrentCanvas(workspace);
+    const canvasIndex = savedWorkspace.canvases.findIndex(
+      (item) => item.id === canvas.id,
+    );
+    const remainingCanvases = savedWorkspace.canvases.filter(
+      (item) => item.id !== canvas.id,
+    );
+    const nextCanvas = remainingCanvases[Math.max(0, canvasIndex - 1)];
+    void activateCanvas(
+      nextCanvas.id,
+      {
+        activeCanvasId: nextCanvas.id,
+        canvases: remainingCanvases,
+      },
+      false,
+    );
   };
 
   const [latestShareableLink, setLatestShareableLink] = useState<string | null>(
@@ -940,6 +1297,7 @@ const ExcalidrawWrapper = () => {
 
   return (
     <div
+      ref={appContainerRef}
       style={{ height: "100%" }}
       className={clsx("excalidraw-app", {
         "is-collaborating": isCollaborating,
@@ -1297,6 +1655,17 @@ const ExcalidrawWrapper = () => {
           />
         )}
       </Excalidraw>
+      {canvasManager && (
+        <CanvasManager
+          activeCanvasId={canvasManager.activeCanvasId}
+          canvases={canvasManager.canvases.map(({ id, name }) => ({ id, name }))}
+          disabled={isCollaborating || isSwitchingCanvas}
+          onCreate={onCreateCanvas}
+          onDelete={onDeleteCanvas}
+          onRename={onRenameCanvas}
+          onSelect={onSelectCanvas}
+        />
+      )}
     </div>
   );
 };
